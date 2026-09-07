@@ -126,11 +126,17 @@ std::atomic<bool> g_versionsBusy{false};
 std::atomic<bool> g_shuttingDown{false};
 std::mutex g_processMutex;
 std::mutex g_logMutex;
+std::mutex g_webUrlMutex;
+std::mutex g_expectedExitMutex;
 std::wstring g_dshPath;
 std::wstring g_npmPath;
 std::wstring g_webUrl;
+// A new dsh web instance generates a new token.  Until its URL has appeared
+// on stdout, the previous URL in the log must not be reused.
+bool g_waitingForCurrentWebUrl = false;
 std::wstring g_logPath;
 std::vector<std::wstring> g_versions;
+std::unordered_set<DWORD> g_expectedExitPids;
 
 void Log(const std::wstring& message);
 
@@ -372,13 +378,7 @@ void Log(const std::wstring& message) {
     }
 }
 
-std::wstring ReadLastUrlFromLog() {
-    if (!fs::exists(g_logPath)) return {};
-    std::ifstream file(fs::path(g_logPath), std::ios::binary);
-    if (!file) return {};
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    const std::wstring text = FromUtf8(buffer.str());
+std::wstring ExtractLastWebUrl(const std::wstring& text) {
     static const std::wregex pattern(LR"((https?://(?:127\.0\.0\.1|localhost):[0-9]+/\?token=\S+))", std::regex_constants::icase);
     std::wsregex_iterator it(text.begin(), text.end(), pattern);
     std::wsregex_iterator end;
@@ -386,6 +386,34 @@ std::wstring ReadLastUrlFromLog() {
     for (; it != end; ++it) last = (*it)[1].str();
     while (!last.empty() && (last.back() == L'.' || last.back() == L',' || last.back() == L';' || last.back() == L')')) last.pop_back();
     return last;
+}
+
+std::wstring ReadLastUrlFromLog() {
+    if (!fs::exists(g_logPath)) return {};
+    std::ifstream file(fs::path(g_logPath), std::ios::binary);
+    if (!file) return {};
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return ExtractLastWebUrl(FromUtf8(buffer.str()));
+}
+
+void CaptureCurrentWebUrl(const std::wstring& output) {
+    const std::wstring url = ExtractLastWebUrl(output);
+    if (url.empty()) return;
+    std::lock_guard<std::mutex> lock(g_webUrlMutex);
+    g_webUrl = url;
+    g_waitingForCurrentWebUrl = false;
+}
+
+void ExpectManagedProcessExit(DWORD pid) {
+    if (pid == 0) return;
+    std::lock_guard<std::mutex> lock(g_expectedExitMutex);
+    g_expectedExitPids.insert(pid);
+}
+
+bool ConsumeExpectedManagedProcessExit(DWORD pid) {
+    std::lock_guard<std::mutex> lock(g_expectedExitMutex);
+    return g_expectedExitPids.erase(pid) != 0;
 }
 
 std::vector<DWORD> ListeningPids() {
@@ -442,7 +470,11 @@ bool StartInternal(std::wstring& message) {
         return false;
     }
     EnsureLogDirectory();
-    g_webUrl.clear();
+    {
+        std::lock_guard<std::mutex> urlLock(g_webUrlMutex);
+        g_webUrl.clear();
+        g_waitingForCurrentWebUrl = true;
+    }
     STARTUPINFOW startup{sizeof(STARTUPINFOW)};
     startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     startup.wShowWindow = SW_HIDE;
@@ -476,7 +508,7 @@ bool StartInternal(std::wstring& message) {
     CloseHandle(info.hThread);
     Log(L"已在后台启动 dsh web，管理 PID：" + std::to_wstring(info.dwProcessId) + L"。");
 
-    std::thread([readPipe, process = readerProcess]() {
+    std::thread([readPipe, process = readerProcess, managedPid = info.dwProcessId]() {
         char buffer[4096];
         DWORD bytes = 0;
         std::string pending;
@@ -486,13 +518,27 @@ bool StartInternal(std::wstring& message) {
             while ((newline = pending.find_first_of("\r\n")) != std::string::npos) {
                 const std::string lineText = pending.substr(0, newline);
                 pending.erase(0, newline + 1);
-                if (!lineText.empty()) Log(FromUtf8(lineText));
+                if (!lineText.empty()) {
+                    const std::wstring output = FromUtf8(lineText);
+                    CaptureCurrentWebUrl(output);
+                    Log(output);
+                }
             }
         }
-        if (!pending.empty()) Log(FromUtf8(pending));
+        if (!pending.empty()) {
+            const std::wstring output = FromUtf8(pending);
+            CaptureCurrentWebUrl(output);
+            Log(output);
+        }
         CloseHandle(readPipe);
         DWORD code = 0;
-        if (GetExitCodeProcess(process, &code) && !g_shuttingDown) Log(L"dsh 进程已退出，退出码：" + std::to_wstring(code) + L"。");
+        if (GetExitCodeProcess(process, &code) && !g_shuttingDown) {
+            if (ConsumeExpectedManagedProcessExit(managedPid)) {
+                Log(L"DSH 后台进程已按停止请求退出。 ");
+            } else {
+                Log(L"dsh 进程已退出，退出码：" + std::to_wstring(code) + L"。");
+            }
+        }
         if (process) CloseHandle(process);
     }).detach();
 
@@ -520,16 +566,28 @@ bool StopInternal(std::wstring& message) {
         message = L"DSH Web 当前没有运行。";
         return true;
     }
+    if (hostPid != 0) ExpectManagedProcessExit(hostPid);
     bool stopped = false;
     for (const DWORD pid : pids) {
+        // The wrapper process normally exits after its DSH child is ended.
+        // Process listener PIDs first so taskkill does not report that the
+        // wrapper has disappeared in the meantime.
+        if (pid == hostPid) continue;
         if (pid != hostPid && !IsNodeProcess(pid)) {
             Log(L"端口 3080 被 PID " + std::to_wstring(pid) + L" 占用，但未确认是 Node/DSH，已跳过。 ");
             continue;
         }
-        const auto result = RunCommand(L"taskkill.exe", {L"/PID", std::to_wstring(pid), L"/T", L"/F"}, 10000, true);
+        const auto result = RunCommand(L"taskkill.exe", {L"/PID", std::to_wstring(pid), L"/T", L"/F"}, 10000);
         if (result.exitCode == 0) {
             stopped = true;
             Log(L"已结束 DSH 进程树 PID " + std::to_wstring(pid) + L"。 ");
+        }
+    }
+    if (hostPid != 0 && g_hostProcess && WaitForSingleObject(g_hostProcess, 500) == WAIT_TIMEOUT) {
+        const auto result = RunCommand(L"taskkill.exe", {L"/PID", std::to_wstring(hostPid), L"/T", L"/F"}, 10000);
+        if (result.exitCode == 0) {
+            stopped = true;
+            Log(L"已结束 DSH 管理进程树 PID " + std::to_wstring(hostPid) + L"。 ");
         }
     }
     for (int i = 0; i < 20 && !ListeningPids().empty(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -763,7 +821,18 @@ void SwitchVersion() {
 }
 
 void OpenWeb() {
-    std::wstring url = g_webUrl.empty() ? ReadLastUrlFromLog() : g_webUrl;
+    std::wstring url;
+    bool waitingForCurrentUrl = false;
+    {
+        std::lock_guard<std::mutex> lock(g_webUrlMutex);
+        url = g_webUrl;
+        waitingForCurrentUrl = g_waitingForCurrentWebUrl;
+    }
+    if (url.empty() && waitingForCurrentUrl) {
+        Log(L"DSH Web 正在生成本次启动的访问地址，请稍候再打开网页。 ");
+        return;
+    }
+    if (url.empty()) url = ReadLastUrlFromLog();
     if (url.empty()) {
         Log(L"没有找到带访问令牌的 DSH Web 地址，请先启动或重启 DSH Web。 ");
         return;
